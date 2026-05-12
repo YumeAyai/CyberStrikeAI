@@ -44,6 +44,10 @@ type Server struct {
 	runningCancels        map[string]context.CancelFunc
 	runningCancelsMu      sync.Mutex
 	abortUserNotes        map[string]string // 监控页终止时附带的用户说明，与 executionID 对应
+	// httpToolTimeoutMinutes 同步 agent.tool_timeout_minutes，用于 POST /api/mcp 的 tools/call（不经 Agent 包装的路径）。
+	// nil 表示未配置，沿用默认 30 分钟；指向 0 表示不限制；>0 为分钟数。
+	httpToolTimeoutMinutes *int
+	httpToolTimeoutMu      sync.RWMutex
 }
 
 type sseClient struct {
@@ -88,6 +92,39 @@ func NewServerWithStorage(logger *zap.Logger, storage MonitorStorage) *Server {
 	s.initDefaultResources()
 
 	return s
+}
+
+// ConfigureHTTPToolCallTimeoutFromAgentMinutes 将 agent.tool_timeout_minutes 同步到经 HTTP POST /api/mcp 触发的 tools/call。
+// minutes<=0 表示不设置硬性截止时间（与配置「0 不限制」一致）；minutes>0 为该次调用的最长等待时间。
+// 未调用前对 tools/call 使用默认 30 分钟（与历史硬编码一致）。
+func (s *Server) ConfigureHTTPToolCallTimeoutFromAgentMinutes(minutes int) {
+	if s == nil {
+		return
+	}
+	v := minutes
+	if v < 0 {
+		v = 0
+	}
+	s.httpToolTimeoutMu.Lock()
+	defer s.httpToolTimeoutMu.Unlock()
+	s.httpToolTimeoutMinutes = &v
+}
+
+func (s *Server) effectiveHTTPToolCallDeadline() (context.Context, context.CancelFunc) {
+	const defaultDur = 30 * time.Minute
+	if s == nil {
+		return context.WithTimeout(context.Background(), defaultDur)
+	}
+	s.httpToolTimeoutMu.RLock()
+	mPtr := s.httpToolTimeoutMinutes
+	s.httpToolTimeoutMu.RUnlock()
+	if mPtr == nil {
+		return context.WithTimeout(context.Background(), defaultDur)
+	}
+	if *mPtr <= 0 {
+		return context.WithCancel(context.Background())
+	}
+	return context.WithTimeout(context.Background(), time.Duration(*mPtr)*time.Minute)
 }
 
 // RegisterTool 注册工具
@@ -457,7 +494,7 @@ func (s *Server) handleCallTool(msg *Message) *Message {
 		}
 	}
 
-	baseCtx, timeoutCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	baseCtx, timeoutCancel := s.effectiveHTTPToolCallDeadline()
 	defer timeoutCancel()
 	execCtx, runCancel := context.WithCancel(baseCtx)
 	s.registerRunningCancel(executionID, runCancel)
